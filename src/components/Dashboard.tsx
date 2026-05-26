@@ -26,6 +26,16 @@ import type {
 import { parseInputText } from '../utils/parser';
 import { optimizeRoute, haversineDistance } from '../utils/tsp';
 import { geocodeAddresses } from '../services/geocoding';
+import { fetchRouteMatrix } from '../services/routing';
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}秒`;
+  const m = Math.round(seconds / 60);
+  if (m < 60) return `${m}分`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return `${h}時間${rm > 0 ? ` ${rm}分` : ''}`;
+}
 
 const PLACEHOLDER = `株式会社A 広島県広島市中区基町10-52
 タワーB 広島市中区大手町1-2-1
@@ -44,6 +54,9 @@ export function Dashboard() {
   const [errorMessage, setErrorMessage] = useState('');
   const [copied, setCopied] = useState(false);
   const [returnDistance, setReturnDistance] = useState(0);
+  const [returnDuration, setReturnDuration] = useState(0);
+  const [totalDuration, setTotalDuration] = useState(0);
+  const [routeMatrixUsed, setRouteMatrixUsed] = useState(false);
   const resultRef = useRef<HTMLDivElement>(null);
 
   const totalDistance =
@@ -74,6 +87,9 @@ export function Dashboard() {
     setFailedEntries([]);
     setErrorMessage('');
     setReturnDistance(0);
+    setReturnDuration(0);
+    setTotalDuration(0);
+    setRouteMatrixUsed(false);
 
     try {
       // Step 1: Parse waypoints
@@ -170,26 +186,48 @@ export function Dashboard() {
 
       // Step 5: Optimize
       setStatus('optimizing');
-      await new Promise((r) => setTimeout(r, 300));
+      
+      // OSRMで実ルート検索
+      const routeMatrix = await fetchRouteMatrix(tspPoints);
+      setRouteMatrixUsed(!!routeMatrix);
+
+      await new Promise((r) => setTimeout(r, 100)); // 少し待つ（UI更新用）
 
       const stops = optimizeRoute(tspPoints, {
         roundTrip: arrivalMode === 'same',
         fixedEnd: arrivalMode === 'different',
         sortMode,
+        routeMatrix: routeMatrix || undefined,
       });
 
       // Calculate return distance for round trip
+      let retDist = 0;
+      let retDur = 0;
       if (arrivalMode === 'same' && stops.length > 1) {
         const lastStop = stops[stops.length - 1];
         const firstStop = stops[0];
-        const retDist = haversineDistance(
-          lastStop.point.lat,
-          lastStop.point.lng,
-          firstStop.point.lat,
-          firstStop.point.lng
-        );
-        setReturnDistance(retDist);
+        
+        if (routeMatrix) {
+          // tspPoints上でのインデックスを取得して行列から引く
+          const lastIndex = tspPoints.indexOf(lastStop.point);
+          const firstIndex = 0;
+          retDist = routeMatrix.distances[lastIndex][firstIndex] / 1000;
+          retDur = routeMatrix.durations[lastIndex][firstIndex];
+        } else {
+          retDist = haversineDistance(
+            lastStop.point.lat,
+            lastStop.point.lng,
+            firstStop.point.lat,
+            firstStop.point.lng
+          );
+        }
       }
+      setReturnDistance(retDist);
+      setReturnDuration(retDur);
+
+      // 合計時間の計算
+      const totalDur = stops.reduce((sum, stop) => sum + (stop.durationFromPrev || 0), 0) + (arrivalMode === 'same' ? retDur : 0);
+      setTotalDuration(totalDur);
 
       setOptimizedStops(stops);
       setStatus('done');
@@ -222,6 +260,9 @@ export function Dashboard() {
     setErrorMessage('');
     setProgress(null);
     setReturnDistance(0);
+    setReturnDuration(0);
+    setTotalDuration(0);
+    setRouteMatrixUsed(false);
   }, []);
 
   const generateGoogleMapsUrl = useCallback((): string => {
@@ -287,7 +328,7 @@ export function Dashboard() {
             id="departure-input"
             type="text"
             className="textarea-glass w-full px-4 py-2.5 text-sm"
-            placeholder="例: 広島駅"
+            placeholder="名称、または住所を入力"
             value={departureText}
             onChange={(e) => setDepartureText(e.target.value)}
             disabled={isProcessing}
@@ -339,7 +380,7 @@ export function Dashboard() {
               id="arrival-input"
               type="text"
               className="textarea-glass w-full px-4 py-2.5 text-sm animate-fade-in-up"
-              placeholder="例: 広島空港"
+              placeholder="名称、または住所を入力"
               value={arrivalText}
               onChange={(e) => setArrivalText(e.target.value)}
               disabled={isProcessing}
@@ -531,7 +572,7 @@ export function Dashboard() {
               </div>
               <div className="text-right">
                 <p className="text-xs font-medium text-text-muted">
-                  総移動距離（直線）
+                  {routeMatrixUsed ? '総走行距離（実走）' : '総移動距離（直線）'}
                 </p>
                 <p className="mt-0.5 text-lg font-bold text-accent-400">
                   {totalDistance.toFixed(1)}
@@ -541,6 +582,12 @@ export function Dashboard() {
                 </p>
               </div>
             </div>
+            {routeMatrixUsed && totalDuration > 0 && (
+              <div className="mt-3 flex items-center justify-between border-t border-dark-500/30 pt-3">
+                <p className="text-xs font-medium text-text-muted">予想移動時間（車）</p>
+                <p className="text-sm font-bold text-text-primary">{formatDuration(totalDuration)}</p>
+              </div>
+            )}
           </div>
 
           {/* Google Maps Button */}
@@ -602,9 +649,16 @@ export function Dashboard() {
                       <div className="shrink-0 text-right">
                         <div className="flex items-center gap-1 text-xs text-text-muted">
                           <ArrowRight className="h-3 w-3" />
-                          <span className="font-medium text-accent-400">
-                            {stop.distanceFromPrev.toFixed(1)}km
-                          </span>
+                          <div className="flex flex-col items-end">
+                            <span className="font-medium text-accent-400">
+                              {stop.distanceFromPrev.toFixed(1)}km
+                            </span>
+                            {stop.durationFromPrev !== undefined && (
+                              <span className="text-[0.65rem] text-text-muted">
+                                {formatDuration(stop.durationFromPrev)}
+                              </span>
+                            )}
+                          </div>
                         </div>
                         <span className="mt-0.5 inline-block rounded-md bg-blue-500/15 px-1.5 py-0.5 text-[0.6rem] font-semibold text-blue-400">
                           帰着地
@@ -615,9 +669,16 @@ export function Dashboard() {
                       <div className="shrink-0 text-right">
                         <div className="flex items-center gap-1 text-xs text-text-muted">
                           <ArrowRight className="h-3 w-3" />
-                          <span className="font-medium text-accent-400">
-                            {stop.distanceFromPrev.toFixed(1)}km
-                          </span>
+                          <div className="flex flex-col items-end">
+                            <span className="font-medium text-accent-400">
+                              {stop.distanceFromPrev.toFixed(1)}km
+                            </span>
+                            {stop.durationFromPrev !== undefined && (
+                              <span className="text-[0.65rem] text-text-muted">
+                                {formatDuration(stop.durationFromPrev)}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
                     )}
@@ -644,9 +705,16 @@ export function Dashboard() {
                   <div className="shrink-0 text-right">
                     <div className="flex items-center gap-1 text-xs text-text-muted">
                       <ArrowRight className="h-3 w-3" />
-                      <span className="font-medium text-accent-400">
-                        {returnDistance.toFixed(1)}km
-                      </span>
+                      <div className="flex flex-col items-end">
+                        <span className="font-medium text-accent-400">
+                          {returnDistance.toFixed(1)}km
+                        </span>
+                        {routeMatrixUsed && returnDuration > 0 && (
+                          <span className="text-[0.65rem] text-text-muted">
+                            {formatDuration(returnDuration)}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <span className="mt-0.5 inline-block rounded-md bg-success-500/15 px-1.5 py-0.5 text-[0.6rem] font-semibold text-success-400">
                       帰着
@@ -705,7 +773,8 @@ export function Dashboard() {
       {/* Footer */}
       <footer className="mt-8 pb-6 text-center">
         <p className="text-[0.65rem] leading-relaxed text-text-muted">
-          住所検索は
+          住所検索:
+          {' '}
           <a
             href="https://www.gsi.go.jp/"
             target="_blank"
@@ -714,9 +783,7 @@ export function Dashboard() {
           >
             国土地理院
           </a>
-          {' '}の住所検索APIを使用しています
-          <br />
-          ルート最適化はブラウザ上で完結 ・ API課金ゼロ
+          {' '}住所検索API
         </p>
       </footer>
     </main>

@@ -44,6 +44,8 @@ export interface OptimizedStop {
   point: GeocodedPoint;
   /** 前の地点からの距離（km）。出発地は 0 */
   distanceFromPrev: number;
+  /** 前の地点からの移動時間（秒）。出発地は 0。実ルート検索時のみセットされる */
+  durationFromPrev?: number;
 }
 
 /** アプリケーション全体の処理状態 */

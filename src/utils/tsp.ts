@@ -1,4 +1,5 @@
 import type { GeocodedPoint, OptimizedStop, SortMode } from '../types';
+import type { RouteMatrix } from '../services/routing';
 
 /** 地球の平均半径（km） */
 const EARTH_RADIUS_KM = 6371;
@@ -40,6 +41,27 @@ export interface RouteOptions {
   fixedEnd?: boolean;
   /** ルートの並び順モード（デフォルト: 'optimized'） */
   sortMode?: SortMode;
+  /** 実ルート検索のための距離・時間行列（任意） */
+  routeMatrix?: RouteMatrix;
+}
+
+/** 
+ * 最適化のコスト（基準値）を取得する。
+ * routeMatrix があれば「移動時間（秒）」をコストとし、
+ * なければ「直線距離（km）」をコストとする。
+ */
+function getCost(
+  i: number,
+  j: number,
+  points: GeocodedPoint[],
+  routeMatrix?: RouteMatrix
+): number {
+  if (routeMatrix) {
+    // durations 行列から時間を取得
+    return routeMatrix.durations[i][j];
+  }
+  // フォールバック: 直線距離
+  return haversineDistance(points[i].lat, points[i].lng, points[j].lat, points[j].lng);
 }
 
 /**
@@ -49,7 +71,8 @@ export interface RouteOptions {
  */
 function nearestNeighbor(
   points: GeocodedPoint[],
-  fixedEnd: boolean
+  fixedEnd: boolean,
+  routeMatrix?: RouteMatrix
 ): number[] {
   const n = points.length;
   const visited = new Set<number>([0]);
@@ -69,12 +92,7 @@ function nearestNeighbor(
 
     for (let i = 0; i < n; i++) {
       if (visited.has(i)) continue;
-      const dist = haversineDistance(
-        points[current].lat,
-        points[current].lng,
-        points[i].lat,
-        points[i].lng
-      );
+      const dist = getCost(current, i, points, routeMatrix);
       if (dist < nearestDist) {
         nearestDist = dist;
         nearestIndex = i;
@@ -105,7 +123,8 @@ function twoOpt(
   route: number[],
   points: GeocodedPoint[],
   roundTrip: boolean,
-  fixedEnd: boolean
+  fixedEnd: boolean,
+  routeMatrix?: RouteMatrix
 ): number[] {
   const improved = [...route];
   const n = improved.length;
@@ -121,57 +140,27 @@ function twoOpt(
     for (let i = 1; i < jMax; i++) {
       for (let j = i + 1; j <= jMax; j++) {
         // エッジ1: (i-1) → (i)
-        const d1Before = haversineDistance(
-          points[improved[i - 1]].lat,
-          points[improved[i - 1]].lng,
-          points[improved[i]].lat,
-          points[improved[i]].lng
-        );
+        const d1Before = getCost(improved[i - 1], improved[i], points, routeMatrix);
 
         // エッジ2: (j) → (j+1) または巡回路の復路エッジ
         let d2Before: number;
         if (j + 1 < n) {
-          d2Before = haversineDistance(
-            points[improved[j]].lat,
-            points[improved[j]].lng,
-            points[improved[j + 1]].lat,
-            points[improved[j + 1]].lng
-          );
+          d2Before = getCost(improved[j], improved[j + 1], points, routeMatrix);
         } else if (roundTrip) {
           // 巡回路: 最後→最初への復路エッジ
-          d2Before = haversineDistance(
-            points[improved[j]].lat,
-            points[improved[j]].lng,
-            points[improved[0]].lat,
-            points[improved[0]].lng
-          );
+          d2Before = getCost(improved[j], improved[0], points, routeMatrix);
         } else {
           d2Before = 0;
         }
 
         // 反転後: (i-1) → (j) と (i) → (j+1)
-        const d1After = haversineDistance(
-          points[improved[i - 1]].lat,
-          points[improved[i - 1]].lng,
-          points[improved[j]].lat,
-          points[improved[j]].lng
-        );
+        const d1After = getCost(improved[i - 1], improved[j], points, routeMatrix);
 
         let d2After: number;
         if (j + 1 < n) {
-          d2After = haversineDistance(
-            points[improved[i]].lat,
-            points[improved[i]].lng,
-            points[improved[j + 1]].lat,
-            points[improved[j + 1]].lng
-          );
+          d2After = getCost(improved[i], improved[j + 1], points, routeMatrix);
         } else if (roundTrip) {
-          d2After = haversineDistance(
-            points[improved[i]].lat,
-            points[improved[i]].lng,
-            points[improved[0]].lat,
-            points[improved[0]].lng
-          );
+          d2After = getCost(improved[i], improved[0], points, routeMatrix);
         } else {
           d2After = 0;
         }
@@ -202,7 +191,7 @@ export function optimizeRoute(
   points: GeocodedPoint[],
   options: RouteOptions = {}
 ): OptimizedStop[] {
-  const { roundTrip = false, fixedEnd = false, sortMode = 'optimized' } = options;
+  const { roundTrip = false, fixedEnd = false, sortMode = 'optimized', routeMatrix } = options;
 
   if (points.length === 0) return [];
 
@@ -220,11 +209,10 @@ export function optimizeRoute(
 
   if (sortMode === 'optimized') {
     // TSP: Nearest Neighbor法 + 2-opt法
-    const initialRoute = nearestNeighbor(points, fixedEnd);
-    finalRoute = twoOpt(initialRoute, points, roundTrip, fixedEnd);
+    const initialRoute = nearestNeighbor(points, fixedEnd, routeMatrix);
+    finalRoute = twoOpt(initialRoute, points, roundTrip, fixedEnd, routeMatrix);
   } else {
-    // 近い順 / 遠い順: 出発地からのHaversine距離でソート
-    const departure = points[0];
+    // 近い順 / 遠い順: 出発地からのコスト（距離または時間）でソート
 
     // 中間地点のインデックスを抽出（出発地と帰着地を除く）
     const middleIndices: number[] = [];
@@ -234,15 +222,9 @@ export function optimizeRoute(
 
     // 出発地からの距離でソート
     middleIndices.sort((a, b) => {
-      const distA = haversineDistance(
-        departure.lat, departure.lng,
-        points[a].lat, points[a].lng
-      );
-      const distB = haversineDistance(
-        departure.lat, departure.lng,
-        points[b].lat, points[b].lng
-      );
-      return sortMode === 'nearest' ? distA - distB : distB - distA;
+      const costA = getCost(0, a, points, routeMatrix);
+      const costB = getCost(0, b, points, routeMatrix);
+      return sortMode === 'nearest' ? costA - costB : costB - costA;
     });
 
     // ルートを組み立て: [出発地, ...ソート済み中間地点, (帰着地)]
@@ -255,20 +237,30 @@ export function optimizeRoute(
   // OptimizedStop[]に変換
   const stops: OptimizedStop[] = finalRoute.map((pointIndex, order) => {
     let distanceFromPrev = 0;
+    let durationFromPrev: number | undefined = undefined;
+
     if (order > 0) {
       const prevIndex = finalRoute[order - 1];
-      distanceFromPrev = haversineDistance(
-        points[prevIndex].lat,
-        points[prevIndex].lng,
-        points[pointIndex].lat,
-        points[pointIndex].lng
-      );
+      if (routeMatrix) {
+        // 実走ルートがある場合は、APIが返した距離（m -> km）と時間（秒）を使用
+        distanceFromPrev = routeMatrix.distances[prevIndex][pointIndex] / 1000;
+        durationFromPrev = routeMatrix.durations[prevIndex][pointIndex];
+      } else {
+        // フォールバック: 直線距離
+        distanceFromPrev = haversineDistance(
+          points[prevIndex].lat,
+          points[prevIndex].lng,
+          points[pointIndex].lat,
+          points[pointIndex].lng
+        );
+      }
     }
 
     return {
       order,
       point: points[pointIndex],
       distanceFromPrev,
+      durationFromPrev,
     };
   });
 
